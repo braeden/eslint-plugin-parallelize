@@ -1,6 +1,6 @@
 {
   "name": "eslint-plugin-parallelize",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "ESLint rule that flags sequential awaits with no data dependency between them, and suggests Promise.all groupings for maximal parallelism.",
   "keywords": [
     "eslint",
