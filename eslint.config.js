@@ -1,6 +1,6 @@
 'use strict';
 
-const parallelize = require('./lib/index.js');
+const parallelize = require('./dist/index.js');
 
 module.exports = [
   {

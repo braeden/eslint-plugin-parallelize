@@ -96,6 +96,39 @@ const ok = admin && quota;
 
 The rule reports multi-await `&&`/`||`/`??` trees (message only — the rewrite needs new bindings, so it isn't auto-fixed). Expressions where one operand's assignment feeds another (`(x = await f()) && await g(x)`) are left alone.
 
+### Type-aware mode (automatic)
+
+The rule is fully functional syntactically on any JS/TS codebase. When it runs under `@typescript-eslint/parser` **with type information enabled**, it upgrades automatically — no separate rule, no option:
+
+```js
+// eslint.config.js
+import tseslint from 'typescript-eslint';
+import parallelize from 'eslint-plugin-parallelize';
+
+export default tseslint.config(
+  { languageOptions: { parserOptions: { projectService: true } } },
+  parallelize.configs.recommended,
+);
+```
+
+With types available:
+
+- **Un-awaited promise declarations stop being barriers.** `const p = fetchB();` between two awaits currently splits the run; with types the rule knows `p` is a thenable already in flight, analyzes it for dependencies like any other statement, and can group awaits across it:
+
+  ```ts
+  // before
+  const a = await fetchA();
+  const p = fetchB();
+  const b = await fetchC();
+
+  // after --fix
+  const p = fetchB();
+  const [a, b] = await Promise.all([fetchA(), fetchC()]);
+  ```
+
+- **Awaits of sync-typed values no longer count as async work.** `await parse(x); await parse(y);` starts nothing asynchronous — with types it is not flagged (grouping would gain nothing).
+- **`any`/`unknown` keep the syntactic behavior**, so untyped code is never silently under-reported.
+
 ### Loops
 
 An await inside a loop serializes across iterations. Unlike core `no-await-in-loop`, this rule only reports when the serialization is *unnecessary* — when neither the await's inputs nor the decision to keep looping depend on results from previous iterations:
@@ -166,7 +199,7 @@ Both are almost always acceptable — and usually desirable — under the no-sid
 - Statement-level only: `export const a = await f()`, multi-declarator statements, `return await f()`, and statements containing nested awaits (`await f(await g())`) act as barriers rather than being analyzed.
 - No alias analysis: `a.x = await f(); b.y = await g()` is considered independent when `a` and `b` are distinct variables, even if they alias the same object.
 - No interprocedural analysis: a helper that internally awaits sequentially won't be seen.
-- Purely syntactic promise detection: no type information is used (and none is needed for the core analysis — `await` itself marks the async boundary). A future type-aware mode (via typescript-eslint services) could catch promise-returning calls that are serialized without `await`, and thenables with side-effectful getters.
+- Without type information, promise detection is purely syntactic: un-awaited promise-typed declarations act as run barriers, and awaits of sync values are treated as async work. Enable `projectService` (see type-aware mode) to lift both.
 - Ternaries (`await c() ? x : y`) are out of scope for now.
 - Loop taint analysis is variable-level, not flow-sensitive (no SSA): a variable tainted anywhere in the loop is tainted everywhere, which errs toward silence.
 

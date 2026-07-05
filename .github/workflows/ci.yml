@@ -18,6 +18,8 @@ jobs:
           node-version: ${{ matrix.node }}
           cache: npm
       - run: npm ci
+      - run: npm run typecheck
       - run: npm test
-      # Smoke test: the plugin loads and lints the demo without crashing.
+      - run: npm run build
+      # Smoke test: the built plugin loads and lints the demo without crashing.
       - run: npx eslint examples/

@@ -1,9 +1,11 @@
-'use strict';
+import { ESLintUtils, TSESLint, TSESTree } from '@typescript-eslint/utils';
+import type * as ts from 'typescript';
 
 /**
  * Flags sequences of `await` statements (and boolean expressions containing
  * multiple `await`s) whose async operations have no data dependency on each
- * other, and therefore could run concurrently.
+ * other, and therefore could run concurrently. Loops whose awaits carry no
+ * dependency between iterations are flagged too.
  *
  * Dependency analysis is name-exact: it uses ESLint's scope manager to resolve
  * every identifier reference to its variable, classifying reads and writes per
@@ -17,18 +19,28 @@
  *
  * Statements are then assigned to dependency levels (longest-path layering);
  * any level containing two or more awaits means available parallelism, and the
- * layering itself becomes the suggested Promise.all rewrite.
+ * layering itself becomes the auto-fix.
+ *
+ * When the consumer parses with @typescript-eslint and type information is
+ * available (parserOptions.projectService / project), the rule upgrades
+ * automatically:
+ *   - `await` of a call whose type is not thenable no longer counts as
+ *     starting async work (awaiting sync values gains nothing from
+ *     Promise.all), and
+ *   - declarations of un-awaited thenables (`const p = fetchB();`) stop being
+ *     run barriers: they join the dependency analysis, letting runs group
+ *     across them.
+ * `any`/`unknown` types keep the syntactic behavior, so untyped code is not
+ * silently under-reported.
  */
 
-const FUNCTION_TYPES = new Set([
+const FUNCTION_TYPES = new Set<TSESTree.AST_NODE_TYPES | string>([
   'FunctionDeclaration',
   'FunctionExpression',
   'ArrowFunctionExpression',
 ]);
 
-const DECL_KINDS = new Set(['var', 'let', 'const']);
-
-const LOOP_TYPES = new Set([
+const LOOP_TYPES = new Set<TSESTree.AST_NODE_TYPES | string>([
   'ForStatement',
   'ForInStatement',
   'ForOfStatement',
@@ -36,7 +48,49 @@ const LOOP_TYPES = new Set([
   'DoWhileStatement',
 ]);
 
-module.exports = {
+const DECL_KINDS = new Set(['var', 'let', 'const']);
+
+// ts.TypeFlags.Any | ts.TypeFlags.Unknown — literal so `typescript` stays an
+// optional, type-only dependency.
+const ANY_OR_UNKNOWN_FLAGS = 3;
+
+type RefKey = TSESLint.Scope.Variable | string;
+
+interface Refs {
+  reads: Set<RefKey>;
+  writes: Set<RefKey>;
+  identKey: Map<TSESTree.Node, RefKey>;
+}
+
+type Form = 'expr' | 'decl' | 'assign' | 'promise-start';
+
+interface StatementInfo {
+  stmt: TSESTree.Statement;
+  form: Form;
+  kind: string | null;
+  reads: Set<RefKey>;
+  writes: Set<RefKey>;
+  opaque: boolean;
+  startsWork: boolean;
+  exprText: string | null;
+  patternText: string | null;
+}
+
+type Options = [
+  {
+    ignoreTry?: boolean;
+    checkLoops?: boolean;
+  }?,
+];
+
+type MessageIds = 'independent' | 'partial' | 'booleanLogic' | 'loopSequential';
+
+const createRule = ESLintUtils.RuleCreator(
+  () => 'https://github.com/braeden/eslint-plugin-parallelize#readme'
+);
+
+export default createRule<Options, MessageIds>({
+  name: 'no-sequential-await',
   meta: {
     type: 'suggestion',
     docs: {
@@ -65,29 +119,47 @@ module.exports = {
         'Each iteration of this loop awaits work that does not depend on previous iterations — the loop serializes independent async operations. Collect the promises and `await Promise.all(...)` (or use a concurrency-limited map) instead.',
     },
   },
+  defaultOptions: [{}],
 
-  create(context) {
+  create(context, [options]) {
     const sourceCode = context.sourceCode;
-    const options = context.options[0] || {};
-    const ignoreTry = options.ignoreTry === true;
-    const checkLoops = options.checkLoops !== false;
+    const ignoreTry = options?.ignoreTry === true;
+    const checkLoops = options?.checkLoops !== false;
     const visitorKeys = sourceCode.visitorKeys;
+
+    // Type information, when the parser provides it (typescript-eslint with
+    // projectService/project). Absent under espree or without type info.
+    const services = sourceCode.parserServices;
+    const program = services?.program ?? null;
+    const nodeMap = services?.esTreeNodeToTSNodeMap ?? null;
+    const checker = program && nodeMap ? program.getTypeChecker() : null;
+
+    function isNode(value: unknown): value is TSESTree.Node {
+      return (
+        typeof value === 'object' &&
+        value !== null &&
+        typeof (value as { type?: unknown }).type === 'string'
+      );
+    }
 
     /** Generic AST walk using the parser's visitor keys. `visit` may return
      *  false to skip a node's children. */
-    function traverse(node, visit) {
-      if (visit(node) === false) {
+    function traverse(
+      root: TSESTree.Node,
+      visit: (node: TSESTree.Node) => boolean | undefined
+    ): void {
+      if (visit(root) === false) {
         return;
       }
-      for (const key of visitorKeys[node.type] || []) {
-        const child = node[key];
+      for (const key of visitorKeys[root.type] ?? []) {
+        const child = (root as unknown as Record<string, unknown>)[key];
         if (Array.isArray(child)) {
           for (const c of child) {
-            if (c && typeof c.type === 'string') {
+            if (isNode(c)) {
               traverse(c, visit);
             }
           }
-        } else if (child && typeof child.type === 'string') {
+        } else if (isNode(child)) {
           traverse(child, visit);
         }
       }
@@ -95,7 +167,7 @@ module.exports = {
 
     /** Count AwaitExpressions that execute as part of this node itself
      *  (i.e. not inside a nested function body). */
-    function countAwaits(root) {
+    function countAwaits(root: TSESTree.Node): number {
       let count = 0;
       traverse(root, (n) => {
         if (n !== root && FUNCTION_TYPES.has(n.type)) {
@@ -109,10 +181,7 @@ module.exports = {
       return count;
     }
 
-    /** Whether evaluating this expression starts new work (contains a call).
-     *  `await somePromiseVariable` starts nothing — it is already in flight —
-     *  so serializing it after another await costs nothing. */
-    function containsCall(root) {
+    function containsCall(root: TSESTree.Node): boolean {
       let found = false;
       traverse(root, (n) => {
         if (FUNCTION_TYPES.has(n.type)) {
@@ -131,7 +200,51 @@ module.exports = {
       return found;
     }
 
-    function containsMutation(root) {
+    /** 'thenable' | 'sync' | 'unknown' for the expression's static type.
+     *  'unknown' (no type info, any, unknown, errors) preserves the purely
+     *  syntactic behavior. */
+    function typeKind(node: TSESTree.Node): 'thenable' | 'sync' | 'unknown' {
+      if (!checker || !nodeMap) {
+        return 'unknown';
+      }
+      const tsNode = nodeMap.get(node);
+      if (!tsNode) {
+        return 'unknown';
+      }
+      let type: ts.Type;
+      try {
+        type = checker.getTypeAtLocation(tsNode);
+      } catch {
+        return 'unknown';
+      }
+      const parts = type.isUnion() ? type.types : [type];
+      let sawAnyish = false;
+      for (const part of parts) {
+        if ((part.flags & ANY_OR_UNKNOWN_FLAGS) !== 0) {
+          sawAnyish = true;
+          continue;
+        }
+        const then = part.getProperty('then');
+        if (!then) {
+          continue;
+        }
+        const thenType = checker.getTypeOfSymbolAtLocation(then, tsNode);
+        const thenParts = thenType.isUnion() ? thenType.types : [thenType];
+        if (thenParts.some((t) => t.getCallSignatures().length > 0)) {
+          return 'thenable';
+        }
+      }
+      return sawAnyish ? 'unknown' : 'sync';
+    }
+
+    /** Whether evaluating this expression starts new async work. Requires a
+     *  call syntactically; with type info, calls that produce non-thenables
+     *  don't count (awaiting a sync value gains nothing from grouping). */
+    function startsAsyncWork(expr: TSESTree.Node): boolean {
+      return containsCall(expr) && typeKind(expr) !== 'sync';
+    }
+
+    function containsMutation(root: TSESTree.Node): boolean {
       let found = false;
       traverse(root, (n) => {
         if (
@@ -146,15 +259,21 @@ module.exports = {
       return found;
     }
 
-    const within = (inner, outer) => inner[0] >= outer[0] && inner[1] <= outer[1];
+    const within = (
+      inner: Readonly<TSESTree.Range>,
+      outer: Readonly<TSESTree.Range>
+    ): boolean => inner[0] >= outer[0] && inner[1] <= outer[1];
 
-    let cachedRefs = null;
-    function getAllReferences() {
+    let cachedRefs: TSESLint.Scope.Reference[] | null = null;
+    function getAllReferences(): TSESLint.Scope.Reference[] {
       if (!cachedRefs) {
         cachedRefs = [];
-        for (const scope of sourceCode.scopeManager.scopes) {
-          for (const ref of scope.references) {
-            cachedRefs.push(ref);
+        const scopeManager = sourceCode.scopeManager;
+        if (scopeManager) {
+          for (const scope of scopeManager.scopes) {
+            for (const ref of scope.references) {
+              cachedRefs.push(ref);
+            }
           }
         }
       }
@@ -166,15 +285,11 @@ module.exports = {
      * write of a variable. Variables that live entirely inside the range
      * (callback params, statement-local temps) are ignored — they cannot
      * carry a dependency to another statement.
-     *
-     * Returns { reads, writes, identKey } where reads/writes are Sets keyed
-     * by the resolved Variable object (or 'g:<name>' for globals), and
-     * identKey maps each in-range Identifier node to its key.
      */
-    function classifyReferences(range) {
-      const reads = new Set();
-      const writes = new Set();
-      const identKey = new Map();
+    function classifyReferences(range: Readonly<TSESTree.Range>): Refs {
+      const reads = new Set<RefKey>();
+      const writes = new Set<RefKey>();
+      const identKey = new Map<TSESTree.Node, RefKey>();
       for (const ref of getAllReferences()) {
         const id = ref.identifier;
         if (!within(id.range, range)) {
@@ -189,7 +304,7 @@ module.exports = {
         ) {
           continue; // variable is local to this range
         }
-        const key = variable || `g:${id.name}`;
+        const key: RefKey = variable ?? `g:${id.name}`;
         identKey.set(id, key);
         if (ref.isRead()) {
           reads.add(key);
@@ -203,11 +318,11 @@ module.exports = {
 
     /** Record property writes (obj.x = ..., obj.x++, delete obj.x) as writes
      *  to the base object's variable. Untrackable bases (this.x, f().x) make
-     *  the statement an ordering barrier via `opaque`. */
-    function collectMemberWrites(root, refs) {
+     *  the statement an ordering barrier via the returned `opaque` flag. */
+    function collectMemberWrites(root: TSESTree.Node, refs: Refs): boolean {
       let opaque = false;
       traverse(root, (n) => {
-        let target = null;
+        let target: TSESTree.MemberExpression | null = null;
         if (n.type === 'AssignmentExpression' && n.left.type === 'MemberExpression') {
           target = n.left;
         } else if (n.type === 'UpdateExpression' && n.argument.type === 'MemberExpression') {
@@ -222,7 +337,7 @@ module.exports = {
         if (!target) {
           return undefined;
         }
-        let base = target.object;
+        let base: TSESTree.Node = target.object;
         for (;;) {
           if (base.type === 'MemberExpression') {
             base = base.object;
@@ -233,7 +348,7 @@ module.exports = {
           }
         }
         if (base.type === 'Identifier') {
-          refs.writes.add(refs.identKey.get(base) || `g:${base.name}`);
+          refs.writes.add(refs.identKey.get(base) ?? `g:${base.name}`);
         } else {
           opaque = true;
         }
@@ -242,19 +357,30 @@ module.exports = {
       return opaque;
     }
 
+    /** Pattern text without a TS type annotation (`a: number` → `a`); the
+     *  annotation can't survive inside a combined destructuring pattern. */
+    function patternTextOf(pattern: TSESTree.Node): string {
+      const annotation = (pattern as { typeAnnotation?: TSESTree.Node }).typeAnnotation;
+      if (!annotation) {
+        return sourceCode.getText(pattern);
+      }
+      return sourceCode.getText().slice(pattern.range[0], annotation.range[0]);
+    }
+
     /**
      * Recognize the statement forms the sequence analysis understands:
-     *   expr:    await foo();
-     *   decl:    const x = await foo();
-     *   assign:  x = await foo();   /   obj.x = await foo();
-     * Anything else — including statements with more or fewer than exactly
-     * one directly-executing await — is a run barrier.
+     *   expr:          await foo();
+     *   decl:          const x = await foo();
+     *   assign:        x = await foo();   /   obj.x = await foo();
+     *   promise-start: const p = foo();   (type-aware only: thenable, no await)
+     * Anything else is a run barrier.
      */
-    function analyzeStatement(stmt) {
-      let form;
-      let awaitNode;
-      let patternNode = null;
-      let kind = null;
+    function analyzeStatement(stmt: TSESTree.Statement): StatementInfo | null {
+      let form: Form;
+      let awaitNode: TSESTree.AwaitExpression | null = null;
+      let patternNode: TSESTree.Node | null = null;
+      let kind: string | null = null;
+      let initNode: TSESTree.Expression | null = null;
 
       if (stmt.type === 'ExpressionStatement') {
         const e = stmt.expression;
@@ -276,18 +402,34 @@ module.exports = {
         stmt.type === 'VariableDeclaration' &&
         DECL_KINDS.has(stmt.kind) &&
         stmt.declarations.length === 1 &&
-        stmt.declarations[0].init &&
-        stmt.declarations[0].init.type === 'AwaitExpression'
+        stmt.declarations[0].init
       ) {
-        form = 'decl';
-        awaitNode = stmt.declarations[0].init;
-        patternNode = stmt.declarations[0].id;
-        kind = stmt.kind;
+        const init = stmt.declarations[0].init;
+        if (init.type === 'AwaitExpression') {
+          form = 'decl';
+          awaitNode = init;
+          patternNode = stmt.declarations[0].id;
+          kind = stmt.kind;
+        } else if (
+          checker &&
+          countAwaits(stmt) === 0 &&
+          containsCall(init) &&
+          typeKind(init) === 'thenable'
+        ) {
+          // Un-awaited promise creation: already concurrent, and (being
+          // side-effect free) safe to analyze rather than treat as a barrier.
+          form = 'promise-start';
+          patternNode = stmt.declarations[0].id;
+          kind = stmt.kind;
+          initNode = init;
+        } else {
+          return null;
+        }
       } else {
         return null;
       }
 
-      if (countAwaits(stmt) !== 1) {
+      if (form !== 'promise-start' && countAwaits(stmt) !== 1) {
         return null;
       }
 
@@ -308,10 +450,17 @@ module.exports = {
         });
       }
 
-      const argument = awaitNode.argument;
-      let exprText = sourceCode.getText(argument);
-      if (argument.type === 'SequenceExpression') {
-        exprText = `(${exprText})`;
+      let exprText: string | null = null;
+      let startsWork = false;
+      if (awaitNode) {
+        const argument = awaitNode.argument;
+        exprText = sourceCode.getText(argument);
+        if (argument.type === 'SequenceExpression') {
+          exprText = `(${exprText})`;
+        }
+        startsWork = startsAsyncWork(argument);
+      } else if (initNode) {
+        startsWork = false; // already started; grouping gains nothing
       }
 
       return {
@@ -321,13 +470,13 @@ module.exports = {
         reads: refs.reads,
         writes: refs.writes,
         opaque,
-        hasCall: containsCall(argument),
+        startsWork,
         exprText,
-        patternText: patternNode ? sourceCode.getText(patternNode) : null,
+        patternText: patternNode ? patternTextOf(patternNode) : null,
       };
     }
 
-    function intersects(a, b) {
+    function intersects(a: Set<RefKey>, b: Set<RefKey>): boolean {
       for (const item of a) {
         if (b.has(item)) {
           return true;
@@ -336,7 +485,7 @@ module.exports = {
       return false;
     }
 
-    function conflicts(earlier, later) {
+    function conflicts(earlier: StatementInfo, later: StatementInfo): boolean {
       return (
         earlier.opaque ||
         later.opaque ||
@@ -349,8 +498,8 @@ module.exports = {
     /** Longest-path layering: level 1 = no deps within the run; level n =
      *  depends on something at level n-1. Statements sharing a level are
      *  mutually independent (any dependency forces a higher level). */
-    function computeLevels(run) {
-      const levels = new Array(run.length).fill(1);
+    function computeLevels(run: StatementInfo[]): number[] {
+      const levels: number[] = new Array(run.length).fill(1) as number[];
       for (let j = 1; j < run.length; j++) {
         for (let i = 0; i < j; i++) {
           if (conflicts(run[i], run[j])) {
@@ -363,30 +512,39 @@ module.exports = {
 
     /** Build the layered Promise.all rewrite, or null when it can't be done
      *  faithfully (assignment forms, mixed declaration kinds, interleaved
-     *  comments). */
-    function buildReplacement(run, groups) {
+     *  comments). Promise-start statements are emitted verbatim at the top of
+     *  their level — they already run concurrently. */
+    function buildReplacement(run: StatementInfo[], groups: number[][]): string | null {
       for (let i = 1; i < run.length; i++) {
         if (sourceCode.getCommentsBefore(run[i].stmt).length > 0) {
           return null;
         }
       }
 
-      const lines = [];
+      const lines: string[] = [];
       for (let level = 1; level < groups.length; level++) {
         const group = groups[level];
         if (!group) {
           continue;
         }
-        if (group.length === 1) {
-          lines.push(sourceCode.getText(run[group[0]].stmt));
+        const members = group.map((idx) => run[idx]);
+        const starts = members.filter((m) => m.form === 'promise-start');
+        const awaited = members.filter((m) => m.form !== 'promise-start');
+        for (const s of starts) {
+          lines.push(sourceCode.getText(s.stmt));
+        }
+        if (awaited.length === 0) {
           continue;
         }
-        const members = group.map((idx) => run[idx]);
-        if (members.some((m) => m.form === 'assign')) {
+        if (awaited.length === 1) {
+          lines.push(sourceCode.getText(awaited[0].stmt));
+          continue;
+        }
+        if (awaited.some((m) => m.form === 'assign')) {
           return null;
         }
-        const exprs = members.map((m) => m.exprText).join(', ');
-        const declMembers = members.filter((m) => m.form === 'decl');
+        const exprs = awaited.map((m) => m.exprText).join(', ');
+        const declMembers = awaited.filter((m) => m.form === 'decl');
         if (declMembers.length === 0) {
           lines.push(`await Promise.all([${exprs}]);`);
           continue;
@@ -395,7 +553,7 @@ module.exports = {
         if (kinds.size > 1) {
           return null;
         }
-        const patterns = members.map((m) => m.patternText || '');
+        const patterns = awaited.map((m) => m.patternText ?? '');
         while (patterns.length > 0 && patterns[patterns.length - 1] === '') {
           patterns.pop();
         }
@@ -413,29 +571,32 @@ module.exports = {
       return lines.join(`\n${indent}`);
     }
 
-    function checkRun(run) {
+    function checkRun(run: StatementInfo[]): void {
       if (run.length < 2) {
         return;
       }
       const levels = computeLevels(run);
-      const groups = [];
+      const groups: number[][] = [];
       for (let idx = 0; idx < run.length; idx++) {
-        (groups[levels[idx]] = groups[levels[idx]] || []).push(idx);
+        (groups[levels[idx]] ??= []).push(idx);
       }
 
-      const multiGroups = groups.filter((g) => g && g.length >= 2);
+      const isAwaited = (idx: number): boolean => run[idx].form !== 'promise-start';
+      const awaitedTotal = run.filter((m) => m.form !== 'promise-start').length;
+      const multiGroups = groups.filter((g) => g && g.filter(isAwaited).length >= 2);
+
       // Parallelizing only pays off when a group would start new work earlier:
-      // some non-first member must actually kick something off. Awaiting
-      // already-in-flight promises sequentially costs nothing extra.
+      // some non-first awaited member must actually kick something off.
+      // Awaiting already-in-flight promises sequentially costs nothing extra.
       const beneficial = multiGroups.some((g) =>
-        g.slice(1).some((idx) => run[idx].hasCall)
+        g.filter(isAwaited).slice(1).some((idx) => run[idx].startsWork)
       );
       if (!beneficial) {
         return;
       }
 
-      const parallel = multiGroups.reduce((sum, g) => sum + g.length, 0);
-      const fullyIndependent = multiGroups.length === 1 && multiGroups[0].length === run.length;
+      const parallel = multiGroups.reduce((sum, g) => sum + g.filter(isAwaited).length, 0);
+      const fullyIndependent = multiGroups.length === 1 && parallel === awaitedTotal;
       const replacement = buildReplacement(run, groups);
       const firstStmt = run[0].stmt;
       const lastStmt = run[run.length - 1].stmt;
@@ -444,20 +605,17 @@ module.exports = {
         node: firstStmt,
         loc: { start: firstStmt.loc.start, end: lastStmt.loc.end },
         messageId: fullyIndependent ? 'independent' : 'partial',
-        data: { count: String(run.length), parallel: String(parallel) },
+        data: { count: String(awaitedTotal), parallel: String(parallel) },
         fix:
           replacement === null
             ? null
             : (fixer) =>
-                fixer.replaceTextRange(
-                  [firstStmt.range[0], lastStmt.range[1]],
-                  replacement
-                ),
+                fixer.replaceTextRange([firstStmt.range[0], lastStmt.range[1]], replacement),
       });
     }
 
-    function processBody(body) {
-      let run = [];
+    function processBody(body: TSESTree.Statement[]): void {
+      let run: StatementInfo[] = [];
       for (const stmt of body) {
         const info = analyzeStatement(stmt);
         if (info) {
@@ -472,25 +630,23 @@ module.exports = {
 
     /**
      * Loop analysis: an await inside a loop serializes across iterations.
-     * That is only necessary when the await (or the decision to keep
-     * looping) depends on data produced by a previous iteration — e.g. a
-     * paging token. We approximate "produced by a previous iteration" with
-     * a taint pass: variables written by await-containing units are tainted,
-     * and taint propagates through assignments to a fixpoint. The loop is
-     * left alone when:
-     *   - a reported await's inputs read tainted state (paging, folds), or
-     *   - the loop condition reads tainted state or itself awaits (retry,
-     *     polling protocols), or
-     *   - a break/continue/return/throw is guarded by a tainted condition
-     *     (poll-until-done protocols), or
-     *   - the loop is `while (true)` / `for (;;)` (daemons), `for await`,
-     *     or contains an untrackable property write (`this.x = ...`).
+     * That is only necessary when the await (or the decision to keep looping)
+     * depends on data produced by a previous iteration — e.g. a paging token.
+     * Approximated with a taint pass: variables written by await-containing
+     * units are tainted, propagating through assignments to a fixpoint.
      */
-    function isLiteralTrue(n) {
-      return n !== null && n !== undefined && n.type === 'Literal' && n.value === true;
+    function isLiteralTrue(n: TSESTree.Node | null | undefined): boolean {
+      return n != null && n.type === 'Literal' && n.value === true;
     }
 
-    function collectUnit(n) {
+    interface Unit {
+      reads: Set<RefKey>;
+      writes: Set<RefKey>;
+      hasAwait: boolean;
+      opaque: boolean;
+    }
+
+    function collectUnit(n: TSESTree.Node): Unit {
       const refs = classifyReferences(n.range);
       const opaque = collectMemberWrites(n, refs);
       return {
@@ -501,26 +657,34 @@ module.exports = {
       };
     }
 
-    function checkLoop(node) {
+    type LoopNode =
+      | TSESTree.ForStatement
+      | TSESTree.ForInStatement
+      | TSESTree.ForOfStatement
+      | TSESTree.WhileStatement
+      | TSESTree.DoWhileStatement;
+
+    function checkLoop(node: LoopNode): void {
       if (!checkLoops) {
         return;
       }
       if (node.type === 'ForOfStatement' && node.await) {
         return;
       }
+      const test = node.type === 'ForInStatement' || node.type === 'ForOfStatement' ? null : node.test;
       if (
         (node.type === 'WhileStatement' || node.type === 'DoWhileStatement') &&
-        isLiteralTrue(node.test)
+        isLiteralTrue(test)
       ) {
         return;
       }
-      if (node.type === 'ForStatement' && (!node.test || isLiteralTrue(node.test))) {
+      if (node.type === 'ForStatement' && (!test || isLiteralTrue(test))) {
         return;
       }
 
       // Awaits belonging to this loop: directly executing in the body, not
       // inside nested functions or nested loops (those report on their own).
-      const awaits = [];
+      const awaits: TSESTree.AwaitExpression[] = [];
       traverse(node.body, (n) => {
         if (FUNCTION_TYPES.has(n.type) || LOOP_TYPES.has(n.type)) {
           return false;
@@ -534,14 +698,11 @@ module.exports = {
       if (awaits.length === 0) {
         return;
       }
-      if (node.test && countAwaits(node.test) > 0) {
+      if (test && countAwaits(test) > 0) {
         return;
       }
 
-      // Taint pass over every assignment-like unit in the loop (including
-      // nested functions and loops — mutations anywhere are conservative
-      // dependency carriers).
-      const units = [];
+      const units: Unit[] = [];
       let opaque = false;
       traverse(node, (n) => {
         if (
@@ -567,7 +728,7 @@ module.exports = {
         return;
       }
 
-      const tainted = new Set();
+      const tainted = new Set<RefKey>();
       let changed = true;
       while (changed) {
         changed = false;
@@ -584,7 +745,7 @@ module.exports = {
         }
       }
 
-      if (node.test && intersects(classifyReferences(node.test.range).reads, tainted)) {
+      if (test && intersects(classifyReferences(test.range).reads, tainted)) {
         return;
       }
 
@@ -599,8 +760,8 @@ module.exports = {
           n.type === 'ReturnStatement' ||
           n.type === 'ThrowStatement'
         ) {
-          for (let p = n.parent; p && p !== node; p = p.parent) {
-            let cond = null;
+          for (let p: TSESTree.Node | undefined = n.parent; p && p !== node; p = p.parent) {
+            let cond: TSESTree.Node | null = null;
             if (
               p.type === 'IfStatement' ||
               p.type === 'ConditionalExpression' ||
@@ -608,7 +769,7 @@ module.exports = {
               p.type === 'DoWhileStatement' ||
               (p.type === 'ForStatement' && p.test)
             ) {
-              cond = p.test;
+              cond = p.test ?? null;
             } else if (p.type === 'SwitchStatement') {
               cond = p.discriminant;
             }
@@ -626,7 +787,7 @@ module.exports = {
 
       const target = awaits.find(
         (a) =>
-          containsCall(a.argument) &&
+          startsAsyncWork(a.argument) &&
           !intersects(classifyReferences(a.range).reads, tainted)
       );
       if (target) {
@@ -638,11 +799,11 @@ module.exports = {
      *  to short-circuit evaluation. With side-effect-free operands, awaiting
      *  the operands concurrently and combining the booleans afterwards is
      *  equivalent and faster. Reported at the topmost logical expression. */
-    function checkLogical(node) {
+    function checkLogical(node: TSESTree.LogicalExpression): void {
       if (node.parent && node.parent.type === 'LogicalExpression') {
         return;
       }
-      const awaits = [];
+      const awaits: TSESTree.AwaitExpression[] = [];
       traverse(node, (n) => {
         if (FUNCTION_TYPES.has(n.type)) {
           return false;
@@ -661,7 +822,7 @@ module.exports = {
       if (containsMutation(node)) {
         return;
       }
-      if (!awaits.slice(1).some((a) => containsCall(a.argument))) {
+      if (!awaits.slice(1).some((a) => startsAsyncWork(a.argument))) {
         return;
       }
       context.report({
@@ -672,10 +833,10 @@ module.exports = {
     }
 
     return {
-      Program(node) {
+      Program(node): void {
         processBody(node.body);
       },
-      BlockStatement(node) {
+      BlockStatement(node): void {
         if (
           ignoreTry &&
           node.parent &&
@@ -685,7 +846,7 @@ module.exports = {
         }
         processBody(node.body);
       },
-      SwitchCase(node) {
+      SwitchCase(node): void {
         processBody(node.consequent);
       },
       LogicalExpression: checkLogical,
@@ -697,4 +858,4 @@ module.exports = {
       'DoWhileStatement:exit': checkLoop,
     };
   },
-};
+});

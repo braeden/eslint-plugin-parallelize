@@ -1,17 +1,17 @@
-'use strict';
+import { describe, it } from 'node:test';
+import { RuleTester } from 'eslint';
+import rule from '../src/rules/no-sequential-await';
 
-const { describe, it } = require('node:test');
-const { RuleTester } = require('eslint');
-const rule = require('../lib/rules/no-sequential-await.js');
-
-RuleTester.describe = describe;
-RuleTester.it = it;
+// Plain eslint RuleTester + espree: proves the rule works, untyped.
+/* eslint-disable @typescript-eslint/no-explicit-any */
+(RuleTester as any).describe = describe;
+(RuleTester as any).it = it;
 
 const ruleTester = new RuleTester({
   languageOptions: { ecmaVersion: 2022, sourceType: 'module' },
 });
 
-ruleTester.run('no-sequential-await', rule, {
+ruleTester.run('no-sequential-await', rule as any, {
   valid: [
     // A single await has nothing to parallelize with.
     'async function t() {\n  await foo();\n}',
