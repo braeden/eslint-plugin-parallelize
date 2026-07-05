@@ -12,6 +12,13 @@
     "performance"
   ],
   "license": "MIT",
+  "author": "Braeden Smith <braedensmith2@gmail.com>",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/braeden/eslint-plugin-parallelize.git"
+  },
+  "bugs": "https://github.com/braeden/eslint-plugin-parallelize/issues",
+  "homepage": "https://github.com/braeden/eslint-plugin-parallelize#readme",
   "main": "lib/index.js",
   "files": [
     "lib"
