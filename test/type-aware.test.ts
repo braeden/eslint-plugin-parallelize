@@ -48,6 +48,10 @@ ruleTester.run('no-sequential-await (type-aware)', rule, {
 
     // Sync-typed calls in a loop are not async work.
     `${DECLS}async function t(xs: string[]) {\n  for (const x of xs) {\n    await parseNum(x);\n  }\n}`,
+
+    // A promise ALIAS (no call) is not a promise-start; it stays a barrier,
+    // so the two awaits around it never form a run.
+    `${DECLS}async function t(q: Promise<number>) {\n  const a = await fetchA();\n  const p = q;\n  const b = await fetchB();\n  return [a, b, p];\n}`,
   ],
 
   invalid: [
@@ -93,6 +97,27 @@ ruleTester.run('no-sequential-await (type-aware)', rule, {
       code: `${DECLS}async function t(ns: number[]) {\n  for (const n of ns) {\n    await compute(n);\n  }\n}`,
       output: null,
       errors: [{ messageId: 'loopSequential' }],
+    },
+
+    // Union types: Promise<number> | number is possibly-async — still work.
+    {
+      code: `declare function maybeAsync(): Promise<number> | number;\ndeclare function fetchA(): Promise<number>;\nasync function t() {\n  const a = await fetchA();\n  const b = await maybeAsync();\n  return [a, b];\n}`,
+      output: `declare function maybeAsync(): Promise<number> | number;\ndeclare function fetchA(): Promise<number>;\nasync function t() {\n  const [a, b] = await Promise.all([fetchA(), maybeAsync()]);\n  return [a, b];\n}`,
+      errors: [{ messageId: 'independent' }],
+    },
+
+    // Custom thenables (PromiseLike) count as async work.
+    {
+      code: `declare function queryA(): PromiseLike<string>;\ndeclare function queryB(): PromiseLike<string>;\nasync function t() {\n  const a = await queryA();\n  const b = await queryB();\n  return [a, b];\n}`,
+      output: `declare function queryA(): PromiseLike<string>;\ndeclare function queryB(): PromiseLike<string>;\nasync function t() {\n  const [a, b] = await Promise.all([queryA(), queryB()]);\n  return [a, b];\n}`,
+      errors: [{ messageId: 'independent' }],
+    },
+
+    // Custom thenables qualify as promise-starts too.
+    {
+      code: `declare class Query { then(cb: (v: string) => void): Query;\n}\ndeclare function makeQuery(): Query;\ndeclare function fetchA(): Promise<number>;\ndeclare function fetchB(): Promise<number>;\nasync function t() {\n  const a = await fetchA();\n  const q = makeQuery();\n  const b = await fetchB();\n  return [a, b, await q];\n}`,
+      output: `declare class Query { then(cb: (v: string) => void): Query;\n}\ndeclare function makeQuery(): Query;\ndeclare function fetchA(): Promise<number>;\ndeclare function fetchB(): Promise<number>;\nasync function t() {\n  const q = makeQuery();\n  const [a, b] = await Promise.all([fetchA(), fetchB()]);\n  return [a, b, await q];\n}`,
+      errors: [{ messageId: 'independent' }],
     },
   ],
 });
