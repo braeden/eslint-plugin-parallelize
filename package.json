@@ -1,0 +1,32 @@
+{
+  "name": "eslint-plugin-parallelize",
+  "version": "0.1.0",
+  "description": "ESLint rule that flags sequential awaits with no data dependency between them, and suggests Promise.all groupings for maximal parallelism.",
+  "keywords": [
+    "eslint",
+    "eslintplugin",
+    "async",
+    "await",
+    "promise",
+    "parallel",
+    "performance"
+  ],
+  "license": "MIT",
+  "main": "lib/index.js",
+  "files": [
+    "lib"
+  ],
+  "scripts": {
+    "test": "node --test test/",
+    "lint:demo": "eslint examples/"
+  },
+  "peerDependencies": {
+    "eslint": ">=8.40.0"
+  },
+  "devDependencies": {
+    "eslint": "^9.0.0"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
