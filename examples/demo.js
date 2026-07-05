@@ -25,6 +25,25 @@ export async function booleanLogic(user) {
   return (await isAdmin(user)) && (await hasQuota(user));
 }
 
+export async function independentLoop(items) {
+  const out = [];
+  for (const item of items) {
+    out.push(await fetchUser(item)); // flagged: iterations are independent
+  }
+  return out;
+}
+
+export async function pagingLoop(fetchPage) {
+  const all = [];
+  let token;
+  do {
+    const page = await fetchPage(token); // silent: loop-carried dependency
+    all.push(page.items);
+    token = page.next;
+  } while (token);
+  return all;
+}
+
 async function fetchUser(id) {
   return fetch(`/api/user/${id}`);
 }

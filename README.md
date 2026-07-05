@@ -93,6 +93,32 @@ const ok = admin && quota;
 
 The rule reports multi-await `&&`/`||`/`??` trees (message only — the rewrite needs new bindings, so it isn't auto-fixed). Expressions where one operand's assignment feeds another (`(x = await f()) && await g(x)`) are left alone.
 
+### Loops
+
+An await inside a loop serializes across iterations. Unlike core `no-await-in-loop`, this rule only reports when the serialization is *unnecessary* — when neither the await's inputs nor the decision to keep looping depend on results from previous iterations:
+
+```js
+for (const item of items) {
+  await process(item);          // reported: iterations are independent
+}
+
+let token;
+do {
+  const page = await fetchPage(token);   // not reported: loop-carried
+  token = page.next;                     // dependency via the paging token
+} while (token);
+```
+
+This works via a taint pass: variables written from await results are tainted, taint propagates through assignments to a fixpoint, and the loop is left alone when any of these hold:
+
+- a reported await's inputs read tainted state (paging, folds, pointer chases)
+- the loop condition reads tainted state or itself awaits (retry, polling)
+- a `break`/`continue`/`return`/`throw` is guarded by a tainted condition (poll-until-done)
+- the loop is `while (true)`/`for (;;)` (daemons), `for await ... of`, or contains an untrackable property write (`this.x = ...`)
+- the loop only awaits already-in-flight promises
+
+Loop findings are report-only (rewriting to `map` + `Promise.all` changes structure too much to auto-fix safely). If you enable this rule, disable core `no-await-in-loop` — this is a dependency-aware superset of the cases worth flagging.
+
 ### When parallelizing wouldn't help
 
 Awaiting an **already in-flight** promise sequentially costs nothing — the work is already running:
@@ -116,11 +142,12 @@ The rule still reports, but won't auto-fix, when a faithful single-statement rew
 
 ```jsonc
 {
-  "parallelize/no-sequential-await": ["warn", { "ignoreTry": false }]
+  "parallelize/no-sequential-await": ["warn", { "ignoreTry": false, "checkLoops": true }]
 }
 ```
 
 - `ignoreTry` (default `false`) — skip blocks directly inside `try`/`catch`/`finally`. `Promise.all` is fail-fast and starts every operation regardless of which one throws, which can matter for carefully staged error handling even without side effects.
+- `checkLoops` (default `true`) — report loops whose awaits have no loop-carried dependency. Set to `false` if you prefer core `no-await-in-loop`'s blunter behavior (or no loop checking at all).
 
 ## Semantics changed by the fix
 
@@ -137,13 +164,14 @@ Both are almost always acceptable — and usually desirable — under the no-sid
 - No alias analysis: `a.x = await f(); b.y = await g()` is considered independent when `a` and `b` are distinct variables, even if they alias the same object.
 - No interprocedural analysis: a helper that internally awaits sequentially won't be seen.
 - Purely syntactic promise detection: no type information is used (and none is needed for the core analysis — `await` itself marks the async boundary). A future type-aware mode (via typescript-eslint services) could catch promise-returning calls that are serialized without `await`, and thenables with side-effectful getters.
-- Ternaries (`await c() ? x : y`) and loop-carried parallelism (`no-await-in-loop` territory) are out of scope for now.
+- Ternaries (`await c() ? x : y`) are out of scope for now.
+- Loop taint analysis is variable-level, not flow-sensitive (no SSA): a variable tainted anywhere in the loop is tainted everywhere, which errs toward silence.
 
 ## Prior art
 
 Nothing existing does dependency-aware detection of serializable awaits:
 
-- [`no-await-in-loop`](https://eslint.org/docs/latest/rules/no-await-in-loop) (ESLint core) — loops only, no dependency analysis.
+- [`no-await-in-loop`](https://eslint.org/docs/latest/rules/no-await-in-loop) (ESLint core) — loops only, no dependency analysis (flags paging loops that are genuinely sequential; this rule doesn't).
 - [eslint/eslint#17824](https://github.com/eslint/eslint/discussions/17824) and [typescript-eslint#8098](https://github.com/typescript-eslint/typescript-eslint/issues/8098) — the *opposite* concern (don't hold pending promises too long before awaiting).
 - [`eslint-plugin-promise`](https://www.npmjs.com/package/eslint-plugin-promise) — promise hygiene, not scheduling.
 

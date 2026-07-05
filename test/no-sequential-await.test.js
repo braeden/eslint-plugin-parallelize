@@ -83,10 +83,43 @@ ruleTester.run('no-sequential-await', rule, {
     // Awaits in different blocks never form a run.
     'async function t(c) {\n  if (c) {\n    await f();\n  }\n  await g();\n}',
 
-    // Loops are no-await-in-loop’s territory.
-    'async function t(users) {\n  for (const u of users) {\n    await save(u);\n  }\n}',
-
     'async function t() {\n  const a = await f();\n  return a;\n}',
+
+    // Paging: the next request needs the previous response’s token.
+    'async function t(fetchPage) {\n  let token;\n  do {\n    const page = await fetchPage(token);\n    token = page.next;\n  } while (token);\n}',
+
+    // Retry: the loop condition depends on the awaited result.
+    'async function t(attempt) {\n  let ok = false;\n  while (!ok) {\n    ok = await attempt();\n  }\n}',
+
+    // Fold: each await consumes the previous await’s result.
+    'async function t(xs, seed) {\n  let acc = seed;\n  for (const x of xs) {\n    acc = await fold(acc, x);\n  }\n  return acc;\n}',
+
+    // Pointer chase.
+    'async function t(head) {\n  let cur = head;\n  while (cur) {\n    cur = await next(cur);\n  }\n}',
+
+    // Early exit guarded by an await-derived condition (poll-until-done).
+    'async function t(items) {\n  for (const item of items) {\n    const r = await check(item);\n    if (r.bad) {\n      return r;\n    }\n  }\n}',
+
+    // for-await consumes an inherently sequential async iterator.
+    'async function t(stream) {\n  for await (const chunk of stream) {\n    await handle(chunk);\n  }\n}',
+
+    // Awaiting already-in-flight promises in a loop costs nothing.
+    'async function t(promises) {\n  for (const p of promises) {\n    await p;\n  }\n}',
+
+    // Awaiting in the condition is a polling protocol.
+    'async function t() {\n  while (await hasMore()) {\n    await drainOne();\n  }\n}',
+
+    // while (true) daemons are intentional serial loops.
+    'async function t() {\n  while (true) {\n    await tick();\n  }\n}',
+
+    // Untrackable property writes (this.x) disable loop analysis.
+    'class C {\n  async run() {\n    while (this.more) {\n      const page = await this.fetch();\n      this.more = page.more;\n    }\n  }\n}',
+
+    // checkLoops: false restores the old behavior.
+    {
+      code: 'async function t(items) {\n  for (const item of items) {\n    await process(item);\n  }\n}',
+      options: [{ checkLoops: false }],
+    },
 
     // export-wrapped declarations are not analyzed (documented limitation).
     'export const a = await f();\nexport const b = await g();',
@@ -370,6 +403,69 @@ ruleTester.run('no-sequential-await', rule, {
       code: 'async function t(p1) {\n  return await p1 || await c();\n}',
       output: null,
       errors: [{ messageId: 'booleanLogic', data: { count: '2' } }],
+    },
+
+    // ── Loops ────────────────────────────────────────────────────────────
+
+    // The classic: each iteration is independent.
+    {
+      code: 'async function t(items) {\n  for (const item of items) {\n    await process(item);\n  }\n}',
+      output: null,
+      errors: [{ messageId: 'loopSequential' }],
+    },
+
+    // Counter loops: the index does not depend on await results.
+    {
+      code: 'async function t(n) {\n  for (let i = 0; i < n; i++) {\n    await job(i);\n  }\n}',
+      output: null,
+      errors: [{ messageId: 'loopSequential' }],
+    },
+    {
+      code: 'async function t(n) {\n  let i = 0;\n  while (i < n) {\n    await job(i);\n    i++;\n  }\n}',
+      output: null,
+      errors: [{ messageId: 'loopSequential' }],
+    },
+
+    // Collecting results does not create an iteration dependency.
+    {
+      code: 'async function t(items) {\n  const out = [];\n  for (const item of items) {\n    const r = await f(item);\n    out.push(r);\n  }\n  return out;\n}',
+      output: null,
+      errors: [{ messageId: 'loopSequential' }],
+    },
+
+    // Awaits nested inside call arguments are still per-iteration work.
+    {
+      code: 'async function t(items) {\n  const out = [];\n  for (const item of items) {\n    out.push(await transform(item));\n  }\n  return out;\n}',
+      output: null,
+      errors: [{ messageId: 'loopSequential' }],
+    },
+
+    // Keyed stores taint the target, not the await’s inputs.
+    {
+      code: 'async function t(ids, results) {\n  for (const id of ids) {\n    results[id] = await load(id);\n  }\n}',
+      output: null,
+      errors: [{ messageId: 'loopSequential' }],
+    },
+
+    // A guard that never exits the loop is not a dependency.
+    {
+      code: 'async function t(users) {\n  for (const u of users) {\n    if (u.active) {\n      await notify(u);\n    }\n  }\n}',
+      output: null,
+      errors: [{ messageId: 'loopSequential' }],
+    },
+
+    // Iterating a fetched list is still parallelizable per item.
+    {
+      code: 'async function t() {\n  const list = await getList();\n  for (const x of list) {\n    await handle(x);\n  }\n}',
+      output: null,
+      errors: [{ messageId: 'loopSequential' }],
+    },
+
+    // for-in over object keys.
+    {
+      code: 'async function t(obj) {\n  for (const k in obj) {\n    await push(k, obj[k]);\n  }\n}',
+      output: null,
+      errors: [{ messageId: 'loopSequential' }],
     },
   ],
 });
