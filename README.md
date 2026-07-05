@@ -1,5 +1,8 @@
 # eslint-plugin-parallelize
 
+[![CI](https://github.com/braeden/eslint-plugin-parallelize/actions/workflows/ci.yml/badge.svg)](https://github.com/braeden/eslint-plugin-parallelize/actions/workflows/ci.yml)
+[![npm](https://img.shields.io/npm/v/eslint-plugin-parallelize)](https://www.npmjs.com/package/eslint-plugin-parallelize)
+
 An ESLint rule that finds `await`s that run **sequentially but don't depend on each other**, and auto-fixes them into maximally parallel `Promise.all` groupings.
 
 ```js
