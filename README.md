@@ -178,12 +178,20 @@ The rule still reports, but won't auto-fix, when a faithful single-statement rew
 
 ```jsonc
 {
-  "parallelize/no-sequential-await": ["warn", { "ignoreTry": false, "checkLoops": true }]
+  "parallelize/no-sequential-await": [
+    "warn",
+    { "ignoreTry": false, "checkLoops": true, "requireConsumedResult": false }
+  ]
 }
 ```
 
 - `ignoreTry` (default `false`) — skip blocks directly inside `try`/`catch`/`finally`. `Promise.all` is fail-fast and starts every operation regardless of which one throws, which can matter for carefully staged error handling even without side effects.
 - `checkLoops` (default `true`) — report loops whose awaits have no loop-carried dependency. Set to `false` if you prefer core `no-await-in-loop`'s blunter behavior (or no loop checking at all).
+- `requireConsumedResult` (default `false`) — only flag when **every** awaited operation's result is consumed (assigned or destructured to a real binding). A run containing any statement-level `await foo();` — or a declaration/assignment that binds nothing, e.g. `const {} = await foo()` or an all-holes `const [,] = await foo()` — is left alone; likewise a loop whose awaited result is discarded.
+
+  A discarded (void) result is a strong signal the call is there for its **side-effect** (a mutation, cache invalidation, ordered delete, message send), which is exactly where hidden ordering/data dependencies that this analysis can't see tend to live — `await create(...); await refetch(...)`, `await mutate(...); await invalidate(...)`, bottom-up deletes, and so on. Awaits whose results are read back are far more often genuine independent loads (data fetches, `fetchPage`, dynamic `import()`) that parallelize safely.
+
+  This is a conservative, opt-in heuristic: it can suppress a legitimately-parallelizable run whose reads happen to discard their results. Enable it when you want the rule biased hard toward safe suggestions on side-effect-heavy code.
 
 ## Semantics changed by the fix
 

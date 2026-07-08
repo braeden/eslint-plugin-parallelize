@@ -132,6 +132,31 @@ ruleTester.run('no-sequential-await', rule as any, {
 
     // Condition await and body await are in different runs.
     'async function t() {\n  if (await a()) {\n    await b();\n  }\n}',
+
+    // requireConsumedResult: a discarded (statement-level) await suppresses the
+    // whole run — bare awaits are side-effects with hidden ordering deps.
+    {
+      code: 'async function t() {\n  await foo();\n  await bar();\n}',
+      options: [{ requireConsumedResult: true }],
+    },
+
+    // requireConsumedResult: one discarded await taints an otherwise-safe run.
+    {
+      code: 'async function t() {\n  const a = await foo();\n  await bar();\n  return a;\n}',
+      options: [{ requireConsumedResult: true }],
+    },
+
+    // requireConsumedResult: destructuring that binds nothing counts as unused.
+    {
+      code: 'async function t() {\n  const {} = await foo();\n  const {} = await bar();\n}',
+      options: [{ requireConsumedResult: true }],
+    },
+
+    // requireConsumedResult: loop over a discarded side-effect await is skipped.
+    {
+      code: 'async function t(items) {\n  for (const item of items) {\n    await process(item);\n  }\n}',
+      options: [{ requireConsumedResult: true }],
+    },
   ],
 
   invalid: [
@@ -464,6 +489,31 @@ ruleTester.run('no-sequential-await', rule as any, {
     // for-in over object keys.
     {
       code: 'async function t(obj) {\n  for (const k in obj) {\n    await push(k, obj[k]);\n  }\n}',
+      output: null,
+      errors: [{ messageId: 'loopSequential' }],
+    },
+
+    // requireConsumedResult: every result is consumed, so it still fires.
+    {
+      code: 'async function t() {\n  const a = await foo();\n  const b = await bar();\n  return [a, b];\n}',
+      options: [{ requireConsumedResult: true }],
+      output:
+        'async function t() {\n  const [a, b] = await Promise.all([foo(), bar()]);\n  return [a, b];\n}',
+      errors: [{ messageId: 'independent' }],
+    },
+
+    // requireConsumedResult: an assignment consumes its result, so it still fires.
+    {
+      code: 'async function t() {\n  let a, b;\n  a = await foo();\n  b = await bar();\n  return [a, b];\n}',
+      options: [{ requireConsumedResult: true }],
+      output: null,
+      errors: [{ messageId: 'independent' }],
+    },
+
+    // requireConsumedResult: a loop whose await result is consumed still fires.
+    {
+      code: 'async function t(items, results) {\n  for (const item of items) {\n    results.push(await process(item));\n  }\n}',
+      options: [{ requireConsumedResult: true }],
       output: null,
       errors: [{ messageId: 'loopSequential' }],
     },
