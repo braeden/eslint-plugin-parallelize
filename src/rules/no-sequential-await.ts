@@ -72,6 +72,7 @@ interface StatementInfo {
   writes: Set<RefKey>;
   opaque: boolean;
   startsWork: boolean;
+  consumed: boolean;
   exprText: string | null;
   patternText: string | null;
 }
@@ -80,6 +81,7 @@ type Options = [
   {
     ignoreTry?: boolean;
     checkLoops?: boolean;
+    requireConsumedResult?: boolean;
   }?,
 ];
 
@@ -104,6 +106,7 @@ export default createRule<Options, MessageIds>({
         properties: {
           ignoreTry: { type: 'boolean' },
           checkLoops: { type: 'boolean' },
+          requireConsumedResult: { type: 'boolean' },
         },
         additionalProperties: false,
       },
@@ -125,6 +128,7 @@ export default createRule<Options, MessageIds>({
     const sourceCode = context.sourceCode;
     const ignoreTry = options?.ignoreTry === true;
     const checkLoops = options?.checkLoops !== false;
+    const requireConsumedResult = options?.requireConsumedResult === true;
     const visitorKeys = sourceCode.visitorKeys;
 
     // Type information, when the parser provides it (typescript-eslint with
@@ -357,6 +361,22 @@ export default createRule<Options, MessageIds>({
       return opaque;
     }
 
+    /** Whether an assignment/declaration target actually binds the awaited
+     *  result somewhere. A bare `await f()` has no target; `const {} = ...` /
+     *  `const [,] = ...` / `[, ] = ...` bind nothing (all destructure holes);
+     *  anything with an identifier or member target consumes the result. */
+    function patternBinds(pattern: TSESTree.Node): boolean {
+      let binds = false;
+      traverse(pattern, (n) => {
+        if (n.type === 'Identifier' || n.type === 'MemberExpression') {
+          binds = true;
+          return false;
+        }
+        return undefined;
+      });
+      return binds;
+    }
+
     /** Pattern text without a TS type annotation (`a: number` → `a`); the
      *  annotation can't survive inside a combined destructuring pattern. */
     function patternTextOf(pattern: TSESTree.Node): string {
@@ -463,6 +483,14 @@ export default createRule<Options, MessageIds>({
         startsWork = false; // already started; grouping gains nothing
       }
 
+      // Whether the awaited result is used. A bare `await f()` discards it;
+      // a declaration/assignment that binds at least one target consumes it.
+      // Promise-start statements aren't awaited here, so consumption is moot.
+      const consumed =
+        form === 'promise-start'
+          ? true
+          : patternNode !== null && patternBinds(patternNode);
+
       return {
         stmt,
         form,
@@ -471,6 +499,7 @@ export default createRule<Options, MessageIds>({
         writes: refs.writes,
         opaque,
         startsWork,
+        consumed,
         exprText,
         patternText: patternNode ? patternTextOf(patternNode) : null,
       };
@@ -573,6 +602,16 @@ export default createRule<Options, MessageIds>({
 
     function checkRun(run: StatementInfo[]): void {
       if (run.length < 2) {
+        return;
+      }
+      // requireConsumedResult: only flag a run when every awaited operation's
+      // result is consumed. A discarded (statement-level) await is almost
+      // always a side-effect, exactly where hidden ordering dependencies live
+      // that this analysis can't see — so leave the whole run alone.
+      if (
+        requireConsumedResult &&
+        run.some((m) => m.form !== 'promise-start' && !m.consumed)
+      ) {
         return;
       }
       const levels = computeLevels(run);
@@ -788,7 +827,10 @@ export default createRule<Options, MessageIds>({
       const target = awaits.find(
         (a) =>
           startsAsyncWork(a.argument) &&
-          !intersects(classifyReferences(a.range).reads, tainted)
+          !intersects(classifyReferences(a.range).reads, tainted) &&
+          // requireConsumedResult: a bare `await sideEffect(item)` discards its
+          // result — skip it, same as for statement runs.
+          (!requireConsumedResult || a.parent?.type !== 'ExpressionStatement')
       );
       if (target) {
         context.report({ node: target, messageId: 'loopSequential' });
