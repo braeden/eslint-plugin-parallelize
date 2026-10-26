@@ -149,7 +149,7 @@ This works via a taint pass: variables written from await results are tainted, t
 
 - a reported await's inputs read tainted state (paging, folds, pointer chases)
 - the loop condition reads tainted state or itself awaits (retry, polling)
-- a `break`/`continue`/`return`/`throw` is guarded by a tainted condition (poll-until-done)
+- a `break`/`continue`/`return`/`throw` is guarded by a condition that reads tainted state or awaits (poll-until-done, find-first)
 - the loop is `while (true)`/`for (;;)` (daemons), `for await ... of`, or contains an untrackable property write (`this.x = ...`)
 - the loop only awaits already-in-flight promises
 

@@ -812,7 +812,11 @@ export default createRule<Options, MessageIds>({
             } else if (p.type === 'SwitchStatement') {
               cond = p.discriminant;
             }
-            if (cond && intersects(classifyReferences(cond.range).reads, tainted)) {
+            if (
+              cond &&
+              (countAwaits(cond) > 0 ||
+                intersects(classifyReferences(cond.range).reads, tainted))
+            ) {
               guardedExit = true;
               break;
             }

@@ -100,6 +100,9 @@ ruleTester.run('no-sequential-await', rule as any, {
     // Early exit guarded by an await-derived condition (poll-until-done).
     'async function t(items) {\n  for (const item of items) {\n    const r = await check(item);\n    if (r.bad) {\n      return r;\n    }\n  }\n}',
 
+    // Same, with the await inline in the exit condition (find-first).
+    'async function t(items) {\n  for (const item of items) {\n    if (await matches(item)) {\n      return item;\n    }\n  }\n}',
+
     // for-await consumes an inherently sequential async iterator.
     'async function t(stream) {\n  for await (const chunk of stream) {\n    await handle(chunk);\n  }\n}',
 
